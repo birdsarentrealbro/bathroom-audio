@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bathroom Party Video Maker</title>
+  <meta name="description" content="Join audio files, make them sound like a party outside the bathroom you are sitting in, and export a video with your picture — all in your browser.">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="page">
+    <h1>Bathroom Party Video Maker</h1>
+    <p class="tagline">
+      Upload your audio files and a picture. Everything gets joined into one track
+      that sounds like it's playing at a party while you're in the bathroom — muffled
+      music through the wall, people talking, doors opening and closing — and comes
+      back as a video you can watch and download. It all runs in your browser;
+      nothing gets uploaded anywhere.
+    </p>
+  </header>
+
+  <main>
+
+    <section class="card">
+      <h2><span class="step">1</span>Your audio files</h2>
+      <div id="drop-audio" class="dropzone" role="button" tabindex="0" aria-label="Add audio files">
+        <input type="file" id="audio-input" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.oga,.opus,.flac,.webm" multiple hidden>
+        <p>Drop audio files here or <button id="browse-audio" class="linklike" type="button">browse</button></p>
+        <p class="hint">Add as many as you want — they play in the order shown below.</p>
+      </div>
+      <ul id="audio-list" class="file-list"></ul>
+      <button id="audio-clear" class="linklike hidden" type="button">clear all</button>
+    </section>
+
+    <section class="card">
+      <h2><span class="step">2</span>Your picture</h2>
+      <div id="drop-image" class="dropzone" role="button" tabindex="0" aria-label="Add a picture">
+        <input type="file" id="image-input" accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp,.avif" hidden>
+        <p>Drop a picture here or <button id="browse-image" class="linklike" type="button">browse</button></p>
+        <p class="hint">It becomes the whole video — try something party-ish.</p>
+      </div>
+      <div id="image-preview" class="image-preview hidden">
+        <img id="image-thumb" alt="Your selected picture">
+      </div>
+    </section>
+
+    <section class="card">
+      <h2><span class="step">3</span>Party settings</h2>
+      <div class="checks">
+        <label class="check"><input type="checkbox" id="opt-talking" checked> People talking</label>
+        <label class="check"><input type="checkbox" id="opt-doors" checked> Doors opening &amp; closing</label>
+      </div>
+      <div class="slider-row">
+        <label for="opt-muffle">Wall muffle</label>
+        <input type="range" id="opt-muffle" min="250" max="1200" step="10" value="650">
+        <span class="val" id="muffle-val">650 Hz</span>
+      </div>
+      <p class="hint">How muffled the music sounds through the wall — lower = deeper &amp; thicker.</p>
+      <div class="slider-row">
+        <label for="opt-volume">Party sounds</label>
+        <input type="range" id="opt-volume" min="0" max="150" step="5" value="100">
+        <span class="val" id="volume-val">100%</span>
+      </div>
+      <p class="hint">Loudness of the talking and door sounds mixed around your audio.</p>
+    </section>
+
+    <section class="card make">
+      <button id="make-btn" class="primary" type="button" disabled>Make the video</button>
+      <div id="status" class="status hidden">
+        <div class="progress" role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100">
+          <div id="progress-fill" class="fill"></div>
+        </div>
+        <p class="status-line"><span id="status-label">…</span><span id="progress-pct"></span></p>
+      </div>
+    </section>
+
+    <section class="card hidden" id="step-result">
+      <h2><span class="step">4</span>Your video</h2>
+      <video id="result-video" controls playsinline></video>
+      <p class="hint" id="video-info"></p>
+      <div class="result-btns">
+        <a id="download-btn" class="primary download" download="bathroom-party-video.webm">Download video</a>
+        <button id="remake-btn" class="ghost" type="button">Start over</button>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <p>Runs entirely in your browser — your files never leave your device. Made for GitHub Pages.</p>
+  </footer>
+
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+<noscript><p style="text-align:center;color:#fb7185;padding:0 20px">This tool needs JavaScript to run — please enable it and reload.</p></noscript>
+<script src="script.js"></script>
+</body>
+</html>
