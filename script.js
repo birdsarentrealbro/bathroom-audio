@@ -25,6 +25,7 @@ const $ = (id) => document.getElementById(id);
 
 const els = {
   audioInput: $('audio-input'),  browseAudio: $('browse-audio'),  dropAudio: $('drop-audio'),
+  folderInput: $('folder-input'), browseFolder: $('browse-folder'),
   audioList: $('audio-list'),     audioClear: $('audio-clear'),
   imageInput: $('image-input'),   browseImage: $('browse-image'), dropImage: $('drop-image'),
   imagePreview: $('image-preview'), imageThumb: $('image-thumb'),
@@ -37,6 +38,23 @@ const els = {
   result: $('step-result'),      video: $('result-video'),
   info: $('video-info'),         download: $('download-btn'),
   remake: $('remake-btn'),       toasts: $('toasts')
+};
+
+const spEls = {
+  url: $('sp-url'),              importBtn: $('sp-import'),
+  progress: $('sp-progress'),    progressFill: $('sp-progress-fill'),
+  progressText: $('sp-progress-text'),
+  error: $('sp-error'),          connect: $('sp-connect'),
+  cid: $('sp-cid'),              connectBtn: $('sp-connect-btn'),
+  redirect: $('sp-redirect-uri'),
+  panel: $('sp-panel'),          cover: $('sp-cover'),
+  name: $('sp-name'),            meta: $('sp-meta'),          forget: $('sp-forget'),
+  tracks: $('sp-tracks'),        nomatch: $('sp-nomatch'),
+  apply: $('sp-apply'),          previews: $('sp-use-previews'),
+  applyHint: $('sp-apply-hint'), pick: $('sp-file-pick'),
+  helper: $('sp-helper'),        helperCmd: $('sp-helper-cmd'),
+  helperCopy: $('sp-helper-copy'), loadJson: $('sp-load-json'),
+  jsonInput: $('sp-json-input')
 };
 
 let actx = null;          // shared AudioContext
@@ -91,6 +109,10 @@ function isAudioFile(f) {
   return f.type.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg|oga|opus|flac|webm|mp4)$/i.test(f.name);
 }
 
+function isImageFile(f) {
+  return f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(f.name);
+}
+
 function setProgress(pct, label, opts) {
   els.status.classList.remove('hidden');
   const ind = !!(opts && opts.indeterminate);
@@ -113,8 +135,17 @@ function addAudioFiles(list) {
   for (const f of list) (isAudioFile(f) ? ok : skipped).push(f);
   if (skipped.length) toast('Skipped ' + skipped.length + ' non-audio file' + (skipped.length > 1 ? 's' : '') + '.', 'err');
   if (!ok.length) return;
-  audioItems = audioItems.concat(ok.map(f => ({ file: f, name: f.name })));
-  renderAudioList();
+  if (sp.playlist) {
+    ok.forEach((f) => { f.__t = null; f.__xtra = false; });
+    sp.pool = sp.pool.concat(ok);
+    runMatcher();
+    renderSpPanel();
+    const matched = sp.tracks.filter((t) => t.file && !t.skipped).length;
+    toast('Matched ' + matched + ' of ' + sp.tracks.length + ' playlist tracks so far.');
+  } else {
+    audioItems = audioItems.concat(ok.map((f) => ({ file: f, name: f.name })));
+    renderAudioList();
+  }
 }
 
 function renderAudioList() {
@@ -168,7 +199,7 @@ function move(i, d) {
 
 function setImage(f) {
   if (!f) return;
-  if (!f.type.startsWith('image/') && !/\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(f.name)) {
+  if (!isImageFile(f)) {
     toast('That file is not an image.', 'err');
     return;
   }
@@ -179,6 +210,700 @@ function setImage(f) {
   els.imagePreview.classList.remove('hidden');
   els.dropImage.classList.add('slim');
   updateMakeBtn();
+}
+
+function fetchTimeout(url, opts, ms) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms || 12000);
+  return fetch(url, Object.assign({}, opts, { signal: ctl.signal }))
+    .finally(() => clearTimeout(t));
+}
+
+/* ======================= Spotify import =======================
+   Spotify doesn't allow downloading full songs, so a playlist import
+   gives us the track list & order (plus 30-second preview MP3s, which
+   ARE publicly fetchable). Two paths:
+   - public: read Spotify's own embed page through a CORS proxy chain
+   - app:    user's own Spotify app via Authorization Code + PKCE
+     (works for private playlists; no client secret needed) */
+
+const sp = {
+  playlist: null,   // {id, name, cover, url, via}
+  tracks: [],       // {title, subtitle, durMs, previewUrl, key, file, manual, skipped}
+  pool: [],         // files offered to the matcher; __t = matched track idx, __xtra = append anyway
+  cache: new Map()  // playlist id -> parsed data
+};
+
+const SP_PROXIES = [
+  (u) => 'https://cors.eu.org/' + u,
+  (u) => 'https://api.cors.lol/?url=' + encodeURIComponent(u),
+  (u) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
+  (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+  (u) => u
+];
+
+function parseSpotifyInput(raw) {
+  raw = (raw || '').trim();
+  if (!raw) return { ok: false, why: 'empty' };
+  let m = raw.match(/spotify:playlist:([A-Za-z0-9]+)/);
+  if (m) return { ok: true, id: m[1] };
+  m = raw.match(/open\.spotify\.com\/(?:intl-[a-z-]+\/)?(?:user\/[^/]+\/)?playlist\/([A-Za-z0-9]+)/);
+  if (m) return { ok: true, id: m[1] };
+  const other = raw.match(/spotify:(track|album|artist|episode|show):/) ||
+                raw.match(/open\.spotify\.com\/(?:intl-[a-z-]+\/)?(track|album|artist|episode|show)\//);
+  if (other) return { ok: false, why: 'type:' + other[1] };
+  if (/spotify/i.test(raw)) return { ok: false, why: 'unrecognized' };
+  return { ok: false, why: 'notspotify' };
+}
+
+function spToastWhy(why) {
+  if (why === 'empty') toast('Paste a playlist link first.', 'err');
+  else if (why.indexOf('type:') === 0) toast('That\u2019s a Spotify ' + why.slice(5) + ' link \u2014 I need a playlist link.', 'err');
+  else if (why === 'unrecognized') toast('That Spotify link doesn\u2019t look like a playlist.', 'err');
+  else toast('That doesn\u2019t look like a Spotify link.', 'err');
+}
+
+function spShowProgress(text) {
+  spEls.progress.classList.remove('hidden');
+  spEls.progressFill.style.width = '0%';
+  spEls.progressText.textContent = text || 'Loading playlist…';
+}
+function spSetProgress(p, text) {
+  spEls.progressFill.style.width = Math.max(0, Math.min(100, p * 100)) + '%';
+  if (text) spEls.progressText.textContent = text;
+}
+function spHideProgress() { spEls.progress.classList.add('hidden'); }
+
+/* ---- PKCE (user's own app; no secret, works on static hosting) ---- */
+
+function b64url(buf) {
+  let s = '';
+  const b = new Uint8Array(buf);
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function spSaveToken(j) {
+  try {
+    sessionStorage.setItem('bpvm_tok', JSON.stringify({
+      t: j.access_token,
+      exp: Date.now() + (j.expires_in - 30) * 1000,
+      rt: j.refresh_token || null
+    }));
+    if (j.refresh_token) localStorage.setItem('bpvm_rt', j.refresh_token);
+  } catch (e) {}
+}
+
+async function spFreshToken() {
+  let tok = null;
+  try { tok = JSON.parse(sessionStorage.getItem('bpvm_tok') || 'null'); } catch (e) {}
+  if (tok && tok.exp > Date.now()) return tok.t;
+  const rt = (tok && tok.rt) || localStorage.getItem('bpvm_rt');
+  const cid = localStorage.getItem('bpvm_cid');
+  if (!rt || !cid) return null;
+  try {
+    const r = await fetchTimeout('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token', refresh_token: rt, client_id: cid
+      })
+    }, 12000);
+    const j = await r.json();
+    if (j.access_token) { spSaveToken(j); return j.access_token; }
+  } catch (e) {}
+  localStorage.removeItem('bpvm_rt');
+  sessionStorage.removeItem('bpvm_tok');
+  return null;
+}
+
+async function spLogin() {
+  const cid = spEls.cid.value.trim();
+  if (!cid) { toast('Paste your Spotify Client ID first.', 'err'); return; }
+  localStorage.setItem('bpvm_cid', cid);
+  if (!/^https?:$/.test(location.protocol)) {
+    toast('Connecting needs an http(s) page — on GitHub Pages it works fine.', 'err');
+    return;
+  }
+  if (!window.crypto || !crypto.subtle) { toast('This browser can\u2019t do the secure login here.', 'err'); return; }
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  try {
+    localStorage.setItem('bpvm_pkce', JSON.stringify({ verifier, state }));
+  } catch (e) {}
+  localStorage.setItem('bpvm_pending', spEls.url.value.trim());
+  const params = new URLSearchParams({
+    client_id: cid,
+    response_type: 'code',
+    redirect_uri: location.origin + location.pathname,
+    code_challenge_method: 'S256',
+    code_challenge: challenge,
+    state: state,
+    scope: 'playlist-read-private playlist-read-collaborative'
+  });
+  location.assign('https://accounts.spotify.com/authorize?' + params.toString());
+}
+
+async function spHandleCallback() {
+  const q = new URLSearchParams(location.search);
+  const code = q.get('code'), state = q.get('state'), err = q.get('error');
+  if (!code && !err) return;
+  let pk = null;
+  try { pk = JSON.parse(localStorage.getItem('bpvm_pkce') || 'null'); } catch (e) {}
+  history.replaceState(null, '', location.pathname);
+  if (err || !pk || state !== pk.state) {
+    if (err) toast('Spotify connection was cancelled.', 'err');
+    localStorage.removeItem('bpvm_pkce');
+    return;
+  }
+  try {
+    const r = await fetchTimeout('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        redirect_uri: location.origin + location.pathname,
+        client_id: localStorage.getItem('bpvm_cid') || '',
+        code_verifier: pk.verifier
+      })
+    }, 15000);
+    const j = await r.json();
+    if (j.access_token) {
+      spSaveToken(j);
+      toast('Spotify connected ✓');
+    } else {
+      toast('Spotify connection failed: ' + (j.error_description || j.error || 'unknown error'), 'err');
+    }
+  } catch (e) {
+    toast('Spotify connection failed — check your Client ID and redirect URI.', 'err');
+  }
+  localStorage.removeItem('bpvm_pkce');
+  const pending = localStorage.getItem('bpvm_pending');
+  localStorage.removeItem('bpvm_pending');
+  if (pending) {
+    spEls.url.value = pending;
+    importPlaylist();
+  }
+}
+
+/* ---- data fetchers ---- */
+
+async function fetchViaApi(id) {
+  const tok = await spFreshToken();
+  if (!tok) return null;
+  const get = async (url) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const t = attempt ? await spFreshToken() : tok;
+      if (!t) return null;
+      const r = await fetchTimeout(url, { headers: { Authorization: 'Bearer ' + t } }, 12000);
+      if (r.status === 401 && attempt === 0) continue;
+      if (!r.ok) return null;
+      return await r.json();
+    }
+    return null;
+  };
+  const pl = await get('https://api.spotify.com/v1/playlists/' + id);
+  if (!pl) return null;
+  const tracks = [];
+  let url = 'https://api.spotify.com/v1/playlists/' + id + '/tracks?limit=100';
+  let guard = 0;
+  while (url && guard++ < 20) {
+    const page = await get(url);
+    if (!page) break;
+    (page.items || []).forEach((it) => {
+      const t = it && it.track;
+      if (t && t.type === 'track') {
+        tracks.push({
+          title: t.name || '',
+          subtitle: (t.artists || []).map((a) => a.name).filter(Boolean).join(', '),
+          durMs: t.duration_ms || 0,
+          previewUrl: t.preview_url || null,
+          uri: t.uri || null
+        });
+      }
+    });
+    url = page.next;
+  }
+  if (!tracks.length) return null;
+  return {
+    name: pl.name || 'Spotify playlist',
+    cover: (pl.images && pl.images[0] && pl.images[0].url) || null,
+    tracks: tracks
+  };
+}
+
+function parseEmbedHtml(html) {
+  const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+  if (!m) return null;
+  try {
+    const d = JSON.parse(m[1]);
+    const ent = d && d.props && d.props.pageProps && d.props.pageProps.state &&
+                d.props.pageProps.state.data && d.props.pageProps.state.data.entity;
+    if (!ent || !Array.isArray(ent.trackList) || !ent.trackList.length) return null;
+    const attrs = {};
+    (ent.attributes || []).forEach((a) => { if (a && a.key) attrs[a.key] = a.value; });
+    return {
+      name: ent.name || ent.title || 'Spotify playlist',
+      cover: attrs.image_url || null,
+      tracks: ent.trackList.map((t) => ({
+        title: t.title || '',
+        subtitle: t.subtitle || '',
+        durMs: t.duration || 0,
+        previewUrl: (t.audioPreview && t.audioPreview.url) || null,
+        uri: t.uri || null
+      }))
+    };
+  } catch (e) { return null; }
+}
+
+async function fetchViaEmbed(id) {
+  const target = 'https://open.spotify.com/embed/playlist/' + id;
+  for (const wrap of SP_PROXIES) {
+    try {
+      const r = await fetchTimeout(wrap(target), {}, 14000);
+      if (!r.ok) continue;
+      const html = await r.text();
+      const data = parseEmbedHtml(html);
+      if (data) return data;
+    } catch (e) { /* try next proxy */ }
+  }
+  return null;
+}
+
+async function fetchOembed(id) {
+  try {
+    const u = 'https://open.spotify.com/oembed?url=' +
+      encodeURIComponent('https://open.spotify.com/playlist/' + id);
+    const r = await fetchTimeout(u, {}, 8000);
+    if (!r.ok) return null;
+    const j = await r.json();
+    return { name: j.title || null, cover: j.thumbnail_url || null };
+  } catch (e) { return null; }
+}
+
+async function importPlaylist() {
+  if (busy) { toast('Wait for the current job to finish.', 'err'); return; }
+  const parsed = parseSpotifyInput(spEls.url.value);
+  if (!parsed.ok) { spToastWhy(parsed.why); return; }
+
+  if (sp.playlist && sp.playlist.id === parsed.id && sp.tracks.length) {
+    spEls.panel.classList.remove('hidden');
+    spEls.panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    return;
+  }
+
+  spEls.error.classList.add('hidden');
+  spEls.connect.classList.add('hidden');
+  spShowProgress('Loading playlist…');
+
+  let data = null, via = '';
+  if (sp.cache.has(parsed.id)) {
+    data = sp.cache.get(parsed.id); via = 'cache';
+  } else {
+    data = await fetchViaApi(parsed.id);
+    if (data) via = 'app';
+    if (!data) {
+      data = await fetchViaEmbed(parsed.id);
+      if (data) via = 'public';
+    }
+    if (data) sp.cache.set(parsed.id, data);
+  }
+
+  if (!data) {
+    spHideProgress();
+    spEls.error.classList.remove('hidden');
+    spEls.connect.classList.remove('hidden');
+    if (spEls.helper) spEls.helper.open = true;   /* playlist.json path lives there */
+    return;
+  }
+
+  if (!data.cover || !data.name) {
+    const oe = await fetchOembed(parsed.id);
+    if (oe) { data.name = data.name || oe.name; data.cover = data.cover || oe.cover; }
+  }
+
+  sp.playlist = {
+    id: parsed.id,
+    name: data.name || 'Spotify playlist',
+    cover: data.cover || '',
+    url: 'https://open.spotify.com/playlist/' + parsed.id,
+    via: via
+  };
+  sp.tracks = data.tracks.map((t) => ({
+    title: t.title,
+    subtitle: t.subtitle,
+    durMs: t.durMs,
+    previewUrl: t.previewUrl,
+    uri: t.uri,
+    key: normKey((t.subtitle ? t.subtitle + ' ' : '') + t.title),
+    file: null,
+    manual: false,
+    skipped: false
+  }));
+  sp.pool = [];
+  runMatcher();
+
+  spHideProgress();
+  spEls.error.classList.add('hidden');
+  spEls.connect.classList.add('hidden');
+  renderSpPanel();
+  const totMs = sp.tracks.reduce((s, t) => s + (t.durMs || 0), 0);
+  toast('Imported \u201c' + sp.playlist.name + '\u201d \u2014 ' + sp.tracks.length +
+    ' tracks' + (totMs ? ' \u00b7 ' + fmtTime(totMs / 1000) : '') + '.');
+  spEls.panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/* ---- filename <-> track matching ---- */
+
+const NORM_NOISE = /remaster|deluxe|expanded|reissue|bonus|anniversary|edition|explicit|official|video|audio|\bedit\b|\bmix\b|\bversion\b|\bsingle\b|\bmono\b|\bstereo\b|\blive\b|\bradio\b|\binstrumental\b|\bacoustic\b|\bcover\b|\blyric[s]?\b|\bvisualizer\b/i;
+
+function normKey(s) {
+  if (!s) return '';
+  let x = String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  x = x.replace(/[([{]([^)\]}]*)[)\]}]/g, (m, inner) => NORM_NOISE.test(inner) ? ' ' : ' ' + inner + ' ');
+  x = x.replace(/\bfeat\.?(uring)?\b[\s\S]*$/, ' ').replace(/\bft\.?\b[\s\S]*$/, ' ');
+  x = x.replace(/\b(the|a|an|and)\b/g, ' ');
+  x = x.replace(/\b(mp3|mp4|wav|flac|m4a|aac|ogg|oga|opus|webm|wma|aiff?|alac)\b/g, ' ');
+  x = x.replace(/^v\d+\s*[-.]?\s*/, '');
+  x = x.replace(/^\s*0*\d{1,3}\s*[-\u2013._]+\s*/, '');
+  x = x.replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return x;
+}
+
+function matchScore(trackKey, fileKey) {
+  if (!trackKey || !fileKey) return 0;
+  if (trackKey === fileKey) return 1;
+  const shorter = trackKey.length < fileKey.length ? trackKey : fileKey;
+  const longer = shorter === trackKey ? fileKey : trackKey;
+  /* whole-word containment (e.g. "loser" inside "tame impala loser") */
+  if (shorter.length >= 4) {
+    const re = new RegExp('(?:^| )' + shorter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?: |$)');
+    if (re.test(longer)) return 0.85;
+  }
+  const at = new Set(trackKey.split(' ')), af = new Set(fileKey.split(' '));
+  let inter = 0;
+  at.forEach((w) => { if (af.has(w)) inter++; });
+  const union = at.size + af.size - inter;
+  return union ? inter / union : 0;
+}
+
+function fileKeyOf(f) {
+  if (!f.__key) {
+    let base = f.name.replace(/\.[a-z0-9]{1,5}$/i, '');          /* last extension  */
+    base = base.replace(/\.(mp3|mp4|wav|flac|m4a|aac|ogg|oga|opus|webm|wma|aiff?)$/i, ''); /* double ext */
+    f.__key = normKey(base);
+  }
+  return f.__key;
+}
+
+function runMatcher() {
+  if (!sp.playlist) return;
+  sp.pool.forEach((f) => {
+    if (f.__t != null && !(sp.tracks[f.__t] && sp.tracks[f.__t].manual)) f.__t = null;
+  });
+  sp.tracks.forEach((t) => { if (!t.manual) t.file = null; });
+  const pairs = [];
+  sp.tracks.forEach((t, ti) => {
+    if (t.file || t.skipped) return;
+    sp.pool.forEach((f, fi) => {
+      if (f.__t != null) return;
+      const s = matchScore(t.key, fileKeyOf(f));
+      if (s >= 0.42) pairs.push([s, ti, fi]);
+    });
+  });
+  pairs.sort((a, b) => b[0] - a[0]);
+  pairs.forEach((p) => {
+    const t = sp.tracks[p[1]], f = sp.pool[p[2]];
+    if (t.file || f.__t != null) return;
+    t.file = f;
+    f.__t = p[1];
+  });
+}
+
+/* ---- playlist panel rendering ---- */
+
+let prevAudio = null, prevBtn = null;
+
+function stopPreview() {
+  if (prevAudio) { try { prevAudio.pause(); } catch (e) {} prevAudio = null; }
+  if (prevBtn) { prevBtn.textContent = '\u25b6'; prevBtn = null; }
+}
+
+function togglePreview(t, btn) {
+  if (prevBtn === btn) { stopPreview(); return; }
+  stopPreview();
+  prevAudio = new Audio();
+  prevAudio.preload = 'none';
+  prevAudio.src = t.previewUrl;
+  prevAudio.play().catch(() => {
+    toast('Couldn\u2019t play that preview.', 'err');
+    stopPreview();
+  });
+  prevBtn = btn;
+  btn.textContent = '\u25a0';
+  prevAudio.onended = stopPreview;
+  prevAudio.onerror = stopPreview;
+}
+
+function renderSpPanel() {
+  if (!sp.playlist) { spEls.panel.classList.add('hidden'); return; }
+  spEls.panel.classList.remove('hidden');
+  spEls.name.textContent = sp.playlist.name;
+  if (sp.playlist.cover) {
+    spEls.cover.src = sp.playlist.cover;
+    spEls.cover.classList.remove('hidden');
+  } else {
+    spEls.cover.classList.add('hidden');
+  }
+  const totMs = sp.tracks.reduce((s, t) => s + (t.durMs || 0), 0);
+  spEls.meta.textContent = sp.tracks.length + ' tracks' +
+    (totMs ? ' \u00b7 ' + fmtTime(totMs / 1000) : '') +
+    ' \u00b7 ' + (sp.playlist.via === 'app' ? 'via your Spotify app' :
+      sp.playlist.via === 'helper' ? 'track list from playlist.json' : 'public import');
+
+  spEls.tracks.innerHTML = '';
+  sp.tracks.forEach((t, i) => {
+    const li = document.createElement('li');
+    li.className = 'sp-track' + (t.skipped ? ' skipped' : (t.file ? ' matched' : ''));
+
+    const num = document.createElement('span');
+    num.className = 'sp-num';
+    num.textContent = (i + 1) + '.';
+    li.appendChild(num);
+
+    if (t.previewUrl) {
+      const pv = document.createElement('button');
+      pv.type = 'button';
+      pv.className = 'icon sp-prev';
+      pv.title = 'Play 30-second preview';
+      pv.setAttribute('aria-label', 'Preview ' + t.title);
+      pv.textContent = '\u25b6';
+      pv.addEventListener('click', () => togglePreview(t, pv));
+      li.appendChild(pv);
+    } else {
+      const sp2 = document.createElement('span');
+      sp2.style.flex = 'none'; sp2.style.width = '28px';
+      li.appendChild(sp2);
+    }
+
+    const info = document.createElement('div');
+    info.className = 'sp-info';
+    const nm = document.createElement('p');
+    nm.className = 'sp-tname';
+    nm.style.margin = '0';
+    nm.textContent = t.title || '(untitled)';
+    const ar = document.createElement('p');
+    ar.className = 'sp-tartist';
+    ar.style.margin = '0';
+    ar.textContent = t.subtitle || '';
+    info.append(nm, ar);
+    li.appendChild(info);
+
+    const dur = document.createElement('span');
+    dur.className = 'sp-dur';
+    dur.textContent = t.durMs ? fmtTime(t.durMs / 1000) : '';
+    li.appendChild(dur);
+
+    const fileBox = document.createElement('div');
+    fileBox.className = 'sp-file';
+    if (t.file) {
+      const fn = document.createElement('span');
+      fn.className = 'fname';
+      fn.textContent = t.file.name;
+      fn.title = t.file.name;
+      fileBox.appendChild(fn);
+      const un = document.createElement('button');
+      un.type = 'button';
+      un.className = 'sp-mini';
+      un.title = 'Unlink this file';
+      un.textContent = '\u2715';
+      un.addEventListener('click', () => {
+        if (t.file) t.file.__t = null;
+        t.file = null;
+        t.manual = false;
+        runMatcher();
+        renderSpPanel();
+      });
+      fileBox.appendChild(un);
+    } else {
+      const pick = document.createElement('button');
+      pick.type = 'button';
+      pick.className = 'sp-mini';
+      pick.textContent = '+ file';
+      pick.title = 'Pick the audio file for this track';
+      pick.addEventListener('click', () => {
+        pickIdx = i;
+        spEls.pick.click();
+      });
+      fileBox.appendChild(pick);
+    }
+    li.appendChild(fileBox);
+
+    const skip = document.createElement('button');
+    skip.type = 'button';
+    skip.className = 'sp-mini';
+    skip.title = t.skipped ? 'Un-skip this track' : 'Skip this track';
+    skip.textContent = t.skipped ? '\u21ba back' : 'skip';
+    skip.addEventListener('click', () => {
+      t.skipped = !t.skipped;
+      renderSpPanel();
+    });
+    li.appendChild(skip);
+
+    spEls.tracks.appendChild(li);
+  });
+
+  const unmatched = sp.pool.filter((f) => f.__t == null);
+  if (unmatched.length) {
+    spEls.nomatch.classList.remove('hidden');
+    spEls.nomatch.innerHTML = '';
+    const title = document.createElement('p');
+    title.className = 'nm-title';
+    title.textContent = unmatched.length + ' file' + (unmatched.length > 1 ? 's' : '') +
+      ' didn\u2019t match any track:';
+    spEls.nomatch.appendChild(title);
+    unmatched.forEach((f) => {
+      const chip = document.createElement('div');
+      chip.className = 'nm-chip' + (f.__xtra ? ' added' : '');
+      const nm = document.createElement('span');
+      nm.className = 'nm-name';
+      nm.textContent = f.name;
+      nm.title = f.name;
+      const add = document.createElement('button');
+      add.type = 'button';
+      add.className = 'sp-mini';
+      add.textContent = f.__xtra ? 'added' : '+ add anyway';
+      add.title = 'Append this file after the playlist tracks';
+      add.addEventListener('click', () => { f.__xtra = !f.__xtra; renderSpPanel(); });
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'sp-mini';
+      rm.textContent = '\u2715';
+      rm.title = 'Remove this file';
+      rm.addEventListener('click', () => {
+        sp.pool.splice(sp.pool.indexOf(f), 1);
+        renderSpPanel();
+      });
+      chip.append(nm, add, rm);
+      spEls.nomatch.appendChild(chip);
+    });
+  } else {
+    spEls.nomatch.classList.add('hidden');
+  }
+
+  const matched = sp.tracks.filter((t) => t.file && !t.skipped).length;
+  const extras = sp.pool.filter((f) => f.__xtra && f.__t == null).length;
+  const withPrev = sp.tracks.filter((t) => !t.skipped && t.previewUrl).length;
+  spEls.apply.textContent = matched ?
+    'Use matched files (' + matched + ' of ' + sp.tracks.length + ')' : 'Use matched files';
+  spEls.apply.disabled = matched === 0;
+  spEls.previews.textContent = withPrev ?
+    'Use 30s previews (' + withPrev + ')' : 'Use 30s previews';
+  spEls.previews.disabled = withPrev === 0;
+  const missing = sp.tracks.length - sp.tracks.filter((t) => t.file || t.skipped).length;
+  spEls.applyHint.textContent =
+    (missing > 0 ? missing + ' track' + (missing > 1 ? 's' : '') + ' still need' + (missing > 1 ? '' : 's') +
+      ' a file \u2014 skip them, pick files manually, or use previews instead. ' : '') +
+    (extras ? extras + ' extra file' + (extras > 1 ? 's' : '') + ' will be appended after the playlist.' : '');
+  if (!spEls.applyHint.textContent) spEls.applyHint.textContent =
+    'All set \u2014 hit \u201cUse matched files\u201d to load these into step 2 in playlist order.';
+}
+
+let pickIdx = -1;
+
+function applyPlaylist() {
+  const chosen = sp.tracks.filter((t) => t.file && !t.skipped);
+  if (!chosen.length) {
+    toast('No tracks have matching files yet \u2014 drop your audio files in step 2 first.', 'err');
+    return;
+  }
+  audioItems = chosen.map((t) => ({
+    file: t.file,
+    name: (t.subtitle ? t.subtitle + ' \u2014 ' : '') + t.title
+  }));
+  sp.pool.forEach((f) => {
+    if (f.__xtra && f.__t == null) audioItems.push({ file: f, name: f.name });
+  });
+  renderAudioList();
+  const missing = sp.tracks.length - chosen.length;
+  toast('Using ' + chosen.length + ' of ' + sp.tracks.length + ' playlist tracks' +
+    (missing > 0 ? ' \u2014 ' + missing + ' skipped or without a file' : '') + '.');
+  document.querySelector('#drop-audio').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+async function usePreviews() {
+  if (busy) { toast('Wait for the current job to finish.', 'err'); return; }
+  const chosen = sp.tracks.filter((t) => !t.skipped && t.previewUrl);
+  if (!chosen.length) {
+    toast('No playable previews here \u2014 tracks may be skipped or previews unavailable.', 'err');
+    return;
+  }
+  const totalSec = chosen.length * 30;
+  if (totalSec > 900) {
+    toast('Heads up: ' + chosen.length + ' previews \u2248 ' + fmtTime(totalSec) +
+      ' of audio \u2014 the video records in real time, so this will take a while.', 'err');
+  }
+  busy = true;
+  document.body.classList.add('busy');
+  updateMakeBtn();
+  spShowProgress('Fetching previews\u2026 0/' + chosen.length);
+  const items = [];
+  let fail = 0;
+  for (let i = 0; i < chosen.length; i++) {
+    spSetProgress((i + 1) / chosen.length, 'Fetching previews\u2026 ' + (i + 1) + '/' + chosen.length);
+    const t = chosen[i];
+    const label = (t.subtitle ? t.subtitle + ' \u2014 ' : '') + t.title;
+    try {
+      const r = await fetchTimeout(t.previewUrl, {}, 20000);
+      if (!r.ok) throw new Error('http ' + r.status);
+      const b = await r.blob();
+      if (b.size < 20000) throw new Error('too small');
+      items.push({
+        file: new File([b], label + '.mp3', { type: 'audio/mpeg' }),
+        name: label + ' (30s preview)'
+      });
+    } catch (e) { fail++; }
+  }
+  spHideProgress();
+  busy = false;
+  document.body.classList.remove('busy');
+  updateMakeBtn();
+  if (!items.length) {
+    toast('Could not fetch any previews \u2014 check your connection and try again.', 'err');
+    return;
+  }
+  audioItems = items;
+  renderAudioList();
+  toast('Using ' + items.length + ' Spotify previews' +
+    (fail ? ' \u2014 ' + fail + ' failed to load' : '') + '. Now pick a picture and make the video!');
+  document.querySelector('#drop-image').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function resetSpotify() {
+  stopPreview();
+  sp.playlist = null;
+  sp.tracks = [];
+  sp.pool = [];
+  spEls.panel.classList.add('hidden');
+  spEls.error.classList.add('hidden');
+  spHideProgress();
+}
+
+function forgetPlaylist() {
+  if (!sp.playlist) return;
+  const loose = sp.pool.slice();
+  const added = loose.filter((f) =>
+    !audioItems.some((it) => it.file === f));
+  if (added.length) {
+    audioItems = audioItems.concat(added.map((f) => ({ file: f, name: f.name })));
+    renderAudioList();
+  }
+  resetSpotify();
+  toast('Playlist forgotten' +
+    (added.length ? ' \u2014 its ' + added.length + ' file' + (added.length > 1 ? 's' : '') +
+      ' moved to your audio list.' : '.'));
 }
 
 /* ======================= audio engine ======================= */
@@ -660,6 +1385,9 @@ async function makeVideo() {
 function startOver() {
   audioItems = [];
   imageFile = null;
+  resetSpotify();
+  spEls.url.value = '';
+  spSyncHelperCmd();
   if (els.video.src && els.video.src.startsWith('blob:')) URL.revokeObjectURL(els.video.src);
   els.video.removeAttribute('src'); els.video.load();
   if (els.imageThumb.src && els.imageThumb.src.startsWith('blob:')) URL.revokeObjectURL(els.imageThumb.src);
@@ -689,6 +1417,18 @@ els.dropImage.addEventListener('click', (e) => { if (e.target.closest('button'))
 els.audioInput.addEventListener('change', (e) => { addAudioFiles([...e.target.files]); e.target.value = ''; });
 els.imageInput.addEventListener('change', (e) => { setImage(e.target.files[0]); e.target.value = ''; });
 
+/* whole-folder picking (the helper script's spotify-tracks folder) */
+els.browseFolder.addEventListener('click', () => els.folderInput.click());
+els.folderInput.addEventListener('change', (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  const audio = files.filter(isAudioFile);
+  if (!audio.length) { toast('No audio files found in that folder.', 'err'); return; }
+  audio.sort((a, b) => (a.webkitRelativePath || a.name)
+    .localeCompare(b.webkitRelativePath || b.name, undefined, { numeric: true, sensitivity: 'base' }));
+  addAudioFiles(audio);
+});
+
 function wireDrop(zone, onFiles) {
   ['dragenter', 'dragover'].forEach(ev => zone.addEventListener(ev, (e) => {
     e.preventDefault(); zone.classList.add('drag');
@@ -697,19 +1437,170 @@ function wireDrop(zone, onFiles) {
     e.preventDefault(); zone.classList.remove('drag');
   }));
   zone.addEventListener('drop', (e) => {
-    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-      onFiles([...e.dataTransfer.files]);
-    }
+    if (!e.dataTransfer) return;
+    /* capture plain files NOW — the DataTransfer dies with this event */
+    const plainFiles = e.dataTransfer.files ? [...e.dataTransfer.files] : [];
+    /* dragged folders arrive as entries, not files — walk them first */
+    filesFromDataTransfer(e.dataTransfer).then((files) => {
+      if (files && files.length) { onFiles(files); return; }
+      if (plainFiles.length) onFiles(plainFiles);
+    });
   });
 }
 wireDrop(els.dropAudio, addAudioFiles);
-wireDrop(els.dropImage, (files) => setImage(files[0]));
+wireDrop(els.dropImage, (files) =>
+  setImage(files.find(isImageFile) || files[0]));
+
+/* Walks a DataTransfer's items, recursing into dropped directories
+   (Chromium/WebKit/Firefox entries API). Returns null when the drop
+   was plain files — caller then uses dataTransfer.files. */
+function filesFromDataTransfer(dt) {
+  const items = dt.items ? [...dt.items] : [];
+  const entries = [];
+  for (const it of items) {
+    if (it.kind === 'file' && it.webkitGetAsEntry) {
+      const ent = it.webkitGetAsEntry();
+      if (ent) entries.push(ent);
+    }
+  }
+  if (!entries.length) return Promise.resolve(null);
+  const out = [];
+  const walk = (entry) => new Promise((res) => {
+    if (entry.isFile) {
+      entry.file((f) => { out.push(f); res(); }, () => res());
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const readAll = () => reader.readEntries(async (batch) => {
+        if (!batch.length) { res(); return; }
+        for (const e of batch) await walk(e);
+        readAll();                     /* readEntries yields ≤100 at a time */
+      }, () => res());
+      readAll();
+    } else res();
+  });
+  return Promise.all(entries.map(walk)).then(() => {
+    out.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+    return out;
+  });
+}
 
 els.audioClear.addEventListener('click', () => { audioItems = []; renderAudioList(); });
 els.optMuffle.addEventListener('input', () => { els.muffleVal.textContent = els.optMuffle.value + ' Hz'; });
 els.optVolume.addEventListener('input', () => { els.volumeVal.textContent = els.optVolume.value + '%'; });
 els.makeBtn.addEventListener('click', makeVideo);
 els.remake.addEventListener('click', startOver);
+
+/* ---- spotify wiring ---- */
+spEls.importBtn.addEventListener('click', importPlaylist);
+spEls.url.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); importPlaylist(); }
+});
+spEls.forget.addEventListener('click', forgetPlaylist);
+spEls.apply.addEventListener('click', applyPlaylist);
+spEls.previews.addEventListener('click', usePreviews);
+spEls.connectBtn.addEventListener('click', spLogin);
+spEls.pick.addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (f && pickIdx >= 0 && sp.tracks[pickIdx] && isAudioFile(f)) {
+    const t = sp.tracks[pickIdx];
+    if (t.file) t.file.__t = null;
+    f.__t = pickIdx;
+    f.__xtra = false;
+    sp.pool.push(f);
+    t.file = f;
+    t.manual = true;
+    runMatcher();
+    renderSpPanel();
+  } else if (f && !isAudioFile(f)) {
+    toast('That file is not audio.', 'err');
+  }
+  pickIdx = -1;
+});
+spEls.redirect.textContent = location.origin + location.pathname;
+const savedCid = localStorage.getItem('bpvm_cid');
+if (savedCid) spEls.cid.value = savedCid;
+spHandleCallback();
+
+/* ---- helper-script box: live command, copy button, playlist.json ---- */
+
+function spHelperCmdText() {
+  const u = spEls.url.value.trim();
+  const ok = u && parseSpotifyInput(u).ok;
+  return 'python3 spotify_helper.py ' +
+    (ok ? '"' + u + '"' : '"https://open.spotify.com/playlist/\u2026"');
+}
+function spSyncHelperCmd() { spEls.helperCmd.textContent = spHelperCmdText(); }
+spEls.url.addEventListener('input', spSyncHelperCmd);
+spSyncHelperCmd();
+
+function copyText(txt, done) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(txt).then(done, () => copyFallback(txt, done));
+  } else copyFallback(txt, done);
+}
+function copyFallback(txt, done) {
+  const ta = document.createElement('textarea');
+  ta.value = txt;
+  ta.style.cssText = 'position:fixed;opacity:0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); done(); }
+  catch (e) { toast('Copy didn\u2019t work — select the command text yourself.', 'err'); }
+  ta.remove();
+}
+spEls.helperCopy.addEventListener('click', () => {
+  copyText(spEls.helperCmd.textContent, () => toast('Command copied — paste it into a terminal.'));
+});
+
+spEls.loadJson.addEventListener('click', () => spEls.jsonInput.click());
+spEls.jsonInput.addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (f) loadPlaylistJson(f);
+});
+
+async function loadPlaylistJson(file) {
+  if (busy) { toast('Wait for the current job to finish.', 'err'); return; }
+  let j = null;
+  try { j = JSON.parse(await file.text()); }
+  catch (e) {
+    toast('That\u2019s not valid JSON — pick the playlist.json the helper script saved.', 'err');
+    return;
+  }
+  const tracks = (Array.isArray(j && j.tracks) ? j.tracks : [])
+    .filter((t) => t && (t.title || t.artist));
+  if (!tracks.length) { toast('That playlist.json doesn\u2019t contain any tracks.', 'err'); return; }
+  stopPreview();
+  sp.playlist = {
+    id: 'json:' + (j.name || file.name),
+    name: j.name || 'Playlist',
+    cover: j.cover || '',
+    url: j.url || '',
+    via: 'helper'
+  };
+  sp.tracks = tracks.map((t) => ({
+    title: t.title || '',
+    subtitle: t.artist || '',
+    durMs: t.durMs || 0,
+    previewUrl: t.previewUrl || null,
+    uri: null,
+    key: normKey(((t.artist || '') + ' ' + (t.title || '')).trim()),
+    file: null,
+    manual: false,
+    skipped: false
+  }));
+  sp.pool = [];
+  runMatcher();
+  spHideProgress();
+  spEls.error.classList.add('hidden');
+  spEls.connect.classList.add('hidden');
+  renderSpPanel();
+  const totMs = sp.tracks.reduce((s, t) => s + (t.durMs || 0), 0);
+  toast('Loaded \u201c' + sp.playlist.name + '\u201d \u2014 ' + sp.tracks.length + ' tracks' +
+    (totMs ? ' \u00b7 ' + fmtTime(totMs / 1000) : '') + '.');
+  spEls.panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
 
 renderAudioList();
 updateMakeBtn();
