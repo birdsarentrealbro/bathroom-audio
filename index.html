@@ -14,9 +14,9 @@
   <header class="page">
     <h1>Bathroom Party Video Maker</h1>
     <p class="tagline">
-      Upload your audio files and a picture. Everything gets joined into one track
-      that sounds like it's playing at a party while you're in the bathroom — muffled
-      music through the wall, people talking, doors opening and closing — and comes
+      Import a Spotify playlist or upload audio files and a picture. Everything gets joined
+      into one track that sounds like it's playing at a party while you're in the bathroom —
+      muffled music through the wall, people talking, doors opening and closing — and comes
       back as a video you can watch and download. It all runs in your browser;
       nothing gets uploaded anywhere.
     </p>
@@ -24,19 +24,92 @@
 
   <main>
 
+    <section class="card" id="card-spotify">
+      <h2><span class="step">1</span>Spotify playlist <span class="badge">optional</span></h2>
+      <div class="sp-row">
+        <input type="url" id="sp-url" placeholder="https://open.spotify.com/playlist/…" spellcheck="false" autocomplete="off">
+        <button id="sp-import" class="primary small" type="button">Import</button>
+      </div>
+      <p class="hint">Import the playlist to set the <b>track list &amp; order</b>. Then drop in your own audio files and they're matched to the tracks automatically, use the built-in 30-second Spotify previews, or grab the <b>full songs</b> with the helper script below.</p>
+
+      <div id="sp-progress" class="hidden">
+        <div class="mini-progress"><div id="sp-progress-fill"></div></div>
+        <span class="mini-text" id="sp-progress-text">Loading playlist…</span>
+      </div>
+
+      <div id="sp-error" class="sp-error hidden">
+        <p>Couldn't load that playlist. It may be <b>private</b>, deleted, or the public importer is busy — check the link and try again, connect your own free Spotify app below for a reliable import (works with private playlists too), or run the <b>helper script</b> further down and load the <code>playlist.json</code> it saves.</p>
+      </div>
+
+      <div id="sp-connect" class="sp-connect hidden">
+        <p class="hint"><b>One-time setup (~2 min):</b></p>
+        <ol class="hint">
+          <li>Open <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">developer.spotify.com/dashboard</a> and click <b>Create app</b> (any name works).</li>
+          <li>In its settings, add the redirect URI <code id="sp-redirect-uri"></code></li>
+          <li>Copy the <b>Client ID</b> into the box below and connect:</li>
+        </ol>
+        <div class="sp-row">
+          <input type="text" id="sp-cid" placeholder="Paste your Spotify Client ID" spellcheck="false" autocomplete="off">
+          <button id="sp-connect-btn" class="ghost small" type="button">Connect Spotify</button>
+        </div>
+        <p class="hint">The Client ID is stored only in your browser and used only to read the playlist you paste.</p>
+      </div>
+
+      <div id="sp-panel" class="hidden">
+        <div class="sp-head">
+          <img id="sp-cover" alt="Playlist cover">
+          <div class="sp-headtext">
+            <p class="sp-name" id="sp-name"></p>
+            <p class="sp-meta" id="sp-meta"></p>
+          </div>
+          <button id="sp-forget" class="icon" type="button" title="Forget this playlist">✕</button>
+        </div>
+        <p class="hint">Drop your audio files in step 2 — they'll be matched to these tracks automatically. Use <b>▶</b> to preview a track, build the video straight from Spotify's 30-second previews, or get the <b>full songs</b> with the helper script below.</p>
+        <ul id="sp-tracks" class="sp-tracks"></ul>
+        <div id="sp-nomatch" class="sp-nomatch hidden"></div>
+        <div class="sp-actions">
+          <button id="sp-apply" class="primary small" type="button">Use matched files</button>
+          <button id="sp-use-previews" class="ghost small" type="button">Use 30s previews</button>
+        </div>
+        <p class="hint" id="sp-apply-hint"></p>
+      </div>
+      <input type="file" id="sp-file-pick" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.oga,.opus,.flac,.webm" hidden>
+
+      <details id="sp-helper" class="sp-helper">
+        <summary>Get the full songs — helper script <span class="badge">runs on your computer</span></summary>
+
+        <p class="hint">Browsers aren't allowed to download whole songs from Spotify or YouTube — but this tiny Python script can. It reads the playlist and saves each song's audio from YouTube (the classic “metadata&nbsp;+&nbsp;YouTube” method, like <code>spotify-dl</code>, but with no account and no API keys). Files are named <code>01 - Artist - Title</code>, so they snap into the playlist order automatically when you drop them in.</p>
+        <ol class="hint">
+          <li>One-time setup: <a href="https://github.com/yt-dlp/yt-dlp/wiki/Installation" target="_blank" rel="noopener">install yt-dlp</a>, and <a href="spotify_helper.py" download>download spotify_helper.py</a> (it sits next to this page — keep it anywhere on your computer).</li>
+          <li>Run it with your playlist link:
+            <span class="cmd-row">
+              <code class="cmd" id="sp-helper-cmd">python3 spotify_helper.py "https://open.spotify.com/playlist/…"</code>
+              <button id="sp-helper-copy" class="ghost small" type="button">Copy</button>
+            </span>
+          </li>
+          <li>Drop the <code>spotify-tracks</code> folder it creates into step 2 — done.</li>
+        </ol>
+        <p class="hint">The script also saves <code>playlist.json</code>. If the import above ever fails, <button id="sp-load-json" class="linklike" type="button">load playlist.json</button> to get the track list offline instead.
+          <span class="hint-sub">For personal use — please respect Spotify's &amp; YouTube's terms and support the artists.</span>
+        </p>
+        <input type="file" id="sp-json-input" accept=".json,application/json" hidden>
+      </details>
+    </section>
+
     <section class="card">
-      <h2><span class="step">1</span>Your audio files</h2>
+      <h2><span class="step">2</span>Your audio files</h2>
       <div id="drop-audio" class="dropzone" role="button" tabindex="0" aria-label="Add audio files">
         <input type="file" id="audio-input" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.oga,.opus,.flac,.webm" multiple hidden>
-        <p>Drop audio files here or <button id="browse-audio" class="linklike" type="button">browse</button></p>
-        <p class="hint">Add as many as you want — they play in the order shown below.</p>
+        <input type="file" id="folder-input" webkitdirectory multiple hidden>
+        <p>Drop audio files or a whole folder here, or <button id="browse-audio" class="linklike" type="button">browse files</button> / <button id="browse-folder" class="linklike" type="button">pick a folder</button></p>
+        <p class="hint">Add as many as you want — they play in the order shown below. With a playlist imported, dropped files get matched to its tracks instead.</p>
       </div>
       <ul id="audio-list" class="file-list"></ul>
       <button id="audio-clear" class="linklike hidden" type="button">clear all</button>
     </section>
 
     <section class="card">
-      <h2><span class="step">2</span>Your picture</h2>
+      <h2><span class="step">3</span>Your picture</h2>
       <div id="drop-image" class="dropzone" role="button" tabindex="0" aria-label="Add a picture">
         <input type="file" id="image-input" accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp,.avif" hidden>
         <p>Drop a picture here or <button id="browse-image" class="linklike" type="button">browse</button></p>
@@ -48,7 +121,7 @@
     </section>
 
     <section class="card">
-      <h2><span class="step">3</span>Party settings</h2>
+      <h2><span class="step">4</span>Party settings</h2>
       <div class="checks">
         <label class="check"><input type="checkbox" id="opt-talking" checked> People talking</label>
         <label class="check"><input type="checkbox" id="opt-doors" checked> Doors opening &amp; closing</label>
@@ -78,7 +151,7 @@
     </section>
 
     <section class="card hidden" id="step-result">
-      <h2><span class="step">4</span>Your video</h2>
+      <h2><span class="step">5</span>Your video</h2>
       <video id="result-video" controls playsinline></video>
       <p class="hint" id="video-info"></p>
       <div class="result-btns">
@@ -88,6 +161,7 @@
     </section>
 
   </main>
+
 
 </div>
 
