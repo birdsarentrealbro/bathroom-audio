@@ -37,7 +37,9 @@ const els = {
   label: $('status-label'),
   result: $('step-result'),      video: $('result-video'),
   info: $('video-info'),         download: $('download-btn'),
-  remake: $('remake-btn'),       toasts: $('toasts')
+  remake: $('remake-btn'),       toasts: $('toasts'),
+  audioResult: $('result-audio'), resultTitle: $('result-title'),
+  fmtHint: $('fmt-hint'),        imageNote: $('image-note')
 };
 
 const spEls = {
@@ -62,9 +64,19 @@ let audioItems = [];      // [{file, name}]
 let imageFile = null;
 let busy = false;
 let leaveGuard = null;
+let turboCombo = null;    // fast-encode capability, set by probeTurbo()
+const sfxCache = {};      // party sounds, prefetched at page load
+
+/* We render everything at 48 kHz so every output encoder is happy
+   (Opus strictly requires 48k; AAC & MP3 are fine with it too). */
+const OUT_RATE = 48000;
 
 function audioCtx() {
-  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+  if (!actx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    try { actx = new AC({ sampleRate: OUT_RATE }); }
+    catch (e) { actx = new AC(); }
+  }
   if (actx.state === 'suspended') actx.resume();
   return actx;
 }
@@ -125,7 +137,27 @@ function setProgress(pct, label, opts) {
 }
 
 function updateMakeBtn() {
-  els.makeBtn.disabled = busy || audioItems.length === 0 || !imageFile;
+  const mp3 = currentFormat() === 'mp3';
+  els.makeBtn.disabled = busy || audioItems.length === 0 || (!mp3 && !imageFile);
+  els.makeBtn.textContent = busy ? 'Working…' : (mp3 ? 'Make the MP3' : 'Make the video');
+}
+
+function currentFormat() {
+  const r = document.querySelector('input[name="fmt"]:checked');
+  return r ? r.value : 'mp4';
+}
+
+function updateFmtUI() {
+  const mp3 = currentFormat() === 'mp3';
+  if (els.imageNote) els.imageNote.textContent = mp3
+    ? 'Saving MP3? The picture is optional — it is only used in the video.'
+    : '';
+  if (els.fmtHint) els.fmtHint.textContent = mp3
+    ? 'Audio only — the fastest option, and no picture needed.'
+    : (turboCombo
+      ? '⚡ Turbo ready — this browser encodes MP4 many times faster than real time.'
+      : 'This browser can’t fast-encode MP4, so it records in real time. Chrome, Edge and recent Safari are fastest.');
+  updateMakeBtn();
 }
 
 /* ======================= file selection ======================= */
@@ -843,7 +875,7 @@ async function usePreviews() {
   const totalSec = chosen.length * 30;
   if (totalSec > 900) {
     toast('Heads up: ' + chosen.length + ' previews \u2248 ' + fmtTime(totalSec) +
-      ' of audio \u2014 the video records in real time, so this will take a while.', 'err');
+      ' of audio \u2014 that much audio can take a while to process.', 'err');
   }
   busy = true;
   document.body.classList.add('busy');
@@ -929,16 +961,20 @@ function concatToStereo(buffers) {
   return out;
 }
 
-async function loadSound(key, url, store) {
+/* Party sounds are fetched once at page load and cached, so the
+   “make” flow doesn’t wait on the network. */
+async function getSound(key) {
+  if (sfxCache[key]) return sfxCache[key];
   try {
-    const res = await fetch(url, { mode: 'cors' });
+    const res = await fetch(PARTY_SOUNDS[key], { mode: 'cors' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const arr = await res.arrayBuffer();
-    store[key] = await audioCtx().decodeAudioData(arr);
+    const buf = await audioCtx().decodeAudioData(arr);
+    sfxCache[key] = buf;
+    return buf;
   } catch (e) {
     console.warn('Could not load party sound "' + key + '":', e);
-    if (key === 'talking') { els.optTalking.checked = false; els.optTalking.disabled = true; }
-    toast('Couldn\u2019t load the "' + key + '" sound — continuing without it.', 'err');
+    return null;
   }
 }
 
@@ -1089,7 +1125,7 @@ function scheduleDoors(off, opts, dur, master, verbBus, duck, lpA, lpB) {
    offline (much faster than realtime). */
 async function renderPartyAudio(music, opts) {
   const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-  const rate = music.sampleRate;
+  const rate = OUT_RATE;                        // fixed — see note at audioCtx()
   const dur = music.duration;
   const total = dur + 1.4;                      // room for the reverb tail
   const off = new OAC(2, Math.ceil(total * rate), rate);
@@ -1190,6 +1226,19 @@ function pickMime() {
   return '';
 }
 
+/* The slow Ken Burns move: a gentle zoom + drift across the whole
+   video. Shared by the real-time recorder and the fast encoder so
+   both outputs look identical. */
+function drawKenBurns(g, bitmap, W, H, p) {
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, W, H);
+  const zoom = 1 + 0.06 * p;                 // subtle slow zoom
+  const dw = W * zoom, dh = H * zoom;
+  const dx = (W - dw) / 2 + Math.sin(p * Math.PI) * W * 0.012;
+  const dy = (H - dh) / 2 - Math.sin(p * Math.PI) * H * 0.008;
+  g.drawImage(bitmap, dx, dy, dw, dh);
+}
+
 function recordVideo(bitmap, audio, onPct) {
   return new Promise((resolve, reject) => {
     const dims = pickDims(bitmap);
@@ -1200,15 +1249,7 @@ function recordVideo(bitmap, audio, onPct) {
     g.imageSmoothingEnabled = true;
     g.imageSmoothingQuality = 'high';
 
-    const draw = (p) => {
-      g.fillStyle = '#000';
-      g.fillRect(0, 0, W, H);
-      const zoom = 1 + 0.06 * p;                 // subtle slow zoom
-      const dw = W * zoom, dh = H * zoom;
-      const dx = (W - dw) / 2 + Math.sin(p * Math.PI) * W * 0.012;
-      const dy = (H - dh) / 2 - Math.sin(p * Math.PI) * H * 0.008;
-      g.drawImage(bitmap, dx, dy, dw, dh);
-    };
+    const draw = (p) => drawKenBurns(g, bitmap, W, H, p);
     draw(0);
 
     const stream = canvas.captureStream(30);
@@ -1290,6 +1331,182 @@ function fixWebmDuration(v) {
   v.addEventListener('loadedmetadata', onMeta);
 }
 
+/* ======================= fast encoders =======================
+   WebCodecs lets us encode the video as fast as the CPU/GPU can go
+   instead of recording it in real time — a 3-minute song takes
+   seconds, not minutes. We pick the best codec combo the browser
+   supports and mux everything into a proper MP4 with mp4-muxer.
+   If WebCodecs isn't available we fall back to the real-time
+   MediaRecorder path above. */
+
+const TURBO_COMBOS = [
+  { v: 'avc1.640028',   muxV: 'avc', a: 'mp4a.40.2',  muxA: 'aac'   },  // H.264 High + AAC — plays everywhere
+  { v: 'avc1.4D0028',   muxV: 'avc', a: 'mp4a.40.2',  muxA: 'aac'   },  // H.264 Main  + AAC
+  { v: 'avc1.42002A',   muxV: 'avc', a: 'mp4a.40.2',  muxA: 'aac'   },  // H.264 Baseline + AAC
+  { v: 'avc1.640028',   muxV: 'avc', a: 'opus',       muxA: 'opus'  },
+  { v: 'avc1.42002A',   muxV: 'avc', a: 'opus',       muxA: 'opus'  },
+  { v: 'vp09.00.10.08', muxV: 'vp9', a: 'mp4a.40.2',  muxA: 'aac'   },
+  { v: 'vp09.00.10.08', muxV: 'vp9', a: 'opus',       muxA: 'opus'  }
+];
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* A macrotask yield that isn't clamped to 4 ms like setTimeout(0),
+   so the encode loop keeps the progress bar alive at full speed. */
+function yieldToUI() {
+  try {
+    return new Promise((r) => {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => r();
+      ch.port2.postMessage(0);
+    });
+  } catch (e) { return sleep(0); }
+}
+
+async function probeTurbo(W, H) {
+  if (!window.VideoEncoder || !window.AudioEncoder || !window.Mp4Muxer ||
+      typeof VideoFrame === 'undefined' || typeof AudioData === 'undefined') return null;
+  if (/[?&]slow=1\b/.test(location.search)) return null;   // debug: force the real-time path
+  const w = W || 1280, h = H || 720;
+  for (const c of TURBO_COMBOS) {
+    try {
+      const [v, a] = await Promise.all([
+        VideoEncoder.isConfigSupported({ codec: c.v, width: w, height: h, bitrate: 5000000, framerate: 30 }),
+        AudioEncoder.isConfigSupported({ codec: c.a, sampleRate: OUT_RATE, numberOfChannels: 2, bitrate: 192000 })
+      ]);
+      if (v.supported && a.supported) return c;
+    } catch (e) {}
+  }
+  return null;
+}
+
+function videoBitrate(W, H) {
+  return Math.min(12e6, Math.max(2.5e6, Math.round(W * H * 30 * 0.12)));
+}
+
+/* Encodes picture (Ken Burns, 30 fps) + processed audio into an MP4
+   as fast as the machine allows. onPct(p, speed) gets the fraction
+   done and the encoding speed relative to real time. */
+async function encodeFastMp4(bitmap, audio, combo, onPct) {
+  const dims = pickDims(bitmap);
+  const W = dims[0], H = dims[1];
+  const fps = 30;
+  const dur = audio.duration;
+  const totalFrames = Math.max(1, Math.ceil(dur * fps));
+  const frameUs = Math.round(1e6 / fps);
+
+  const muxer = new Mp4Muxer.Muxer({
+    target: new Mp4Muxer.ArrayBufferTarget(),
+    fastStart: 'in-memory',
+    video: { codec: combo.muxV, width: W, height: H },
+    audio: { codec: combo.muxA, numberOfChannels: 2, sampleRate: audio.sampleRate }
+  });
+
+  let encErr = null;
+  const fail = (e) => { if (!encErr) encErr = (e instanceof Error) ? e : new Error(String(e)); };
+
+  const venc = new VideoEncoder({
+    output: (chunk, meta) => { try { muxer.addVideoChunk(chunk, meta); } catch (e) { fail(e); } },
+    error: fail
+  });
+  venc.configure({
+    codec: combo.v, width: W, height: H,
+    bitrate: videoBitrate(W, H), framerate: fps
+  });
+
+  const aenc = new AudioEncoder({
+    output: (chunk, meta) => { try { muxer.addAudioChunk(chunk, meta); } catch (e) { fail(e); } },
+    error: fail
+  });
+  aenc.configure({
+    codec: combo.a, sampleRate: audio.sampleRate,
+    numberOfChannels: 2, bitrate: 192000
+  });
+
+  /* audio runs in parallel with the video frames */
+  const audioJob = (async () => {
+    const rate = audio.sampleRate;
+    const n = audio.length;
+    const L = audio.getChannelData(0);
+    const R = audio.numberOfChannels > 1 ? audio.getChannelData(1) : L;
+    const CH = 8192;
+    for (let off = 0; off < n; off += CH) {
+      if (encErr) return;
+      const m = Math.min(CH, n - off);
+      const data = new Float32Array(m * 2);        // planar: L then R
+      data.set(L.subarray(off, off + m), 0);
+      data.set(R.subarray(off, off + m), m);
+      const ad = new AudioData({
+        format: 'f32-planar', sampleRate: rate, numberOfFrames: m,
+        numberOfChannels: 2, timestamp: Math.round(off / rate * 1e6), data
+      });
+      aenc.encode(ad);
+      ad.close();
+      while (aenc.encodeQueueSize > 16) { if (encErr) return; await sleep(2); }
+    }
+  })();
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const g = canvas.getContext('2d', { alpha: false });
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = 'high';
+
+  const t0 = performance.now();
+  for (let i = 0; i < totalFrames; i++) {
+    if (encErr) throw encErr;
+    drawKenBurns(g, bitmap, W, H, Math.min(1, (i + 1) / totalFrames));
+    const vf = new VideoFrame(canvas, { timestamp: i * frameUs, duration: frameUs });
+    venc.encode(vf, { keyFrame: i % (fps * 2) === 0 });
+    vf.close();
+    while (venc.encodeQueueSize > 10) { if (encErr) break; await sleep(2); }
+    if ((i & 15) === 15 || i === totalFrames - 1) {
+      const secs = (performance.now() - t0) / 1000;
+      const speed = secs > 0.25 ? ((i + 1) / fps) / secs : 0;
+      onPct((i + 1) / totalFrames, speed);
+      await yieldToUI();
+    }
+  }
+  await audioJob;
+  if (encErr) throw encErr;
+  await venc.flush();
+  await aenc.flush();
+  if (encErr) throw encErr;
+  muxer.finalize();
+  return new Blob([muxer.target.buffer], { type: 'video/mp4' });
+}
+
+/* Encodes the finished bathroom mix to MP3 with lamejs — no video,
+   no picture needed, and much faster than real time. */
+async function encodeMp3(audio, onPct) {
+  if (!window.lamejs) throw new Error('The MP3 encoder didn’t load — reload the page and try again.');
+  const enc = new lamejs.Mp3Encoder(2, audio.sampleRate, 192);
+  const L = audio.getChannelData(0);
+  const R = audio.numberOfChannels > 1 ? audio.getChannelData(1) : L;
+  const n = audio.length;
+  const BLOCK = 1152 * 16;                     // whole MP3 frames
+  const li = new Int16Array(BLOCK), ri = new Int16Array(BLOCK);
+  const parts = [];
+  let blocks = 0;
+  for (let off = 0; off < n; off += BLOCK) {
+    const m = Math.min(BLOCK, n - off);
+    for (let i = 0; i < m; i++) {
+      const l = L[off + i], r = R[off + i];
+      li[i] = l < -1 ? -32768 : l > 1 ? 32767 : (l * 32767) | 0;
+      ri[i] = r < -1 ? -32768 : r > 1 ? 32767 : (r * 32767) | 0;
+    }
+    const out = enc.encodeBuffer(
+      m === BLOCK ? li : li.subarray(0, m),
+      m === BLOCK ? ri : ri.subarray(0, m)
+    );
+    if (out.length) parts.push(new Uint8Array(out));
+    if ((blocks++ & 7) === 0) { onPct((off + m) / n); await yieldToUI(); }
+  }
+  const end = enc.flush();
+  if (end.length) parts.push(new Uint8Array(end));
+  return new Blob(parts, { type: 'audio/mpeg' });
+}
+
 /* ======================= main flow ======================= */
 
 function supported() {
@@ -1302,9 +1519,10 @@ function supported() {
 
 async function makeVideo() {
   if (busy) return;
-  if (!supported()) return;
+  const wantMp3 = currentFormat() === 'mp3';
+  if (!wantMp3 && !supported()) return;      // only the video fallback needs MediaRecorder
   if (!audioItems.length) { toast('Add at least one audio file.', 'err'); return; }
-  if (!imageFile) { toast('Add a picture first.', 'err'); return; }
+  if (!wantMp3 && !imageFile) { toast('Add a picture first — or switch the output to MP3 audio.', 'err'); return; }
 
   busy = true;
   document.body.classList.add('busy');
@@ -1314,61 +1532,103 @@ async function makeVideo() {
   window.addEventListener('beforeunload', leaveGuard);
 
   try {
-    await ensureRunning();
-
     const useTalking = els.optTalking.checked && !els.optTalking.disabled;
     const useDoors = els.optDoors.checked && !els.optDoors.disabled;
     const muffle = +els.optMuffle.value;
     const volume = +els.optVolume.value / 100;
 
-    /* phase 1 — decode the user's audio (0 → 30 %) */
-    const buffers = [];
-    for (let i = 0; i < audioItems.length; i++) {
-      setProgress(30 * (i / audioItems.length),
-        'Reading ' + audioItems[i].name + ' (' + (i + 1) + '/' + audioItems.length + ')…');
-      try { buffers.push(await decodeFile(audioItems[i].file)); }
-      catch (e) { throw new Error('Could not decode "' + audioItems[i].name + '". Is it a valid audio file?'); }
-    }
+    /* phase 1 — decode all files in parallel (0 → 25 %) */
+    setProgress(2, 'Reading your audio…');
+    let decoded = 0;
+    const buffers = await Promise.all(audioItems.map(async (it) => {
+      let b;
+      try { b = await decodeFile(it.file); }
+      catch (e) { throw new Error('Could not decode "' + it.name + '". Is it a valid audio file?'); }
+      decoded++;
+      setProgress(25 * decoded / audioItems.length,
+        'Reading ' + it.name + ' (' + decoded + '/' + audioItems.length + ')…');
+      return b;
+    }));
     const music = concatToStereo(buffers);
     if (music.duration < 1) throw new Error('Your audio is too short to process.');
-    const mins = Math.max(1, Math.ceil((music.duration + 10) / 60));
-    if (music.duration > 900) toast('Heads up: long audio = long wait (and lots of memory). Recording happens in real time.', 'err');
 
-    /* phase 2 — fetch the party sounds (30 → 40 %) */
-    setProgress(30, 'Loading party sounds…');
+    /* phase 2 — party sounds (usually prefetched already → instant) */
+    setProgress(27, 'Loading party sounds…');
+    const grab = async (key) => {
+      const b = await getSound(key);
+      if (!b) {
+        if (key === 'talking') { els.optTalking.checked = false; els.optTalking.disabled = true; }
+        else { els.optDoors.checked = false; els.optDoors.disabled = true; }
+      }
+      return b;
+    };
     const sounds = {};
-    const loads = [];
-    if (useTalking) loads.push(loadSound('talking', PARTY_SOUNDS.talking, sounds));
+    if (useTalking) sounds.talking = await grab('talking');
     if (useDoors) {
-      loads.push(loadSound('doorOpen', PARTY_SOUNDS.doorOpen, sounds));
-      loads.push(loadSound('doorClose', PARTY_SOUNDS.doorClose, sounds));
+      sounds.doorOpen = await grab('doorOpen');
+      sounds.doorClose = await grab('doorClose');
     }
-    await Promise.all(loads);
+    if ((useTalking && !sounds.talking) || (useDoors && (!sounds.doorOpen || !sounds.doorClose)))
+      toast('Couldn’t load some party sounds — continuing without them.', 'err');
 
-    /* phase 3 — offline render of the bathroom mix (40 → 50 %) */
-    setProgress(40, 'Mixing the bathroom party sound…', { indeterminate: true });
+    /* phase 3 — offline render of the bathroom mix (fast) */
+    setProgress(31, 'Mixing the bathroom party sound…', { indeterminate: true });
     const finalAudio = await renderPartyAudio(music, { sounds, talking: useTalking, doors: useDoors, muffle, volume });
 
-    /* phase 4 — record the video in real time (50 → 100 %) */
-    const bitmap = await loadBitmap(imageFile);
-    const blob = await recordVideo(bitmap, finalAudio, (p) => {
-      setProgress(50 + p * 50,
-        'Recording your video… keep this tab visible (takes about ' + mins + ' min)');
-    });
-    setProgress(100, 'Done — your video is ready below!');
+    /* phase 4 — encode (40 → 100 %) */
+    let blob, ext, codecDesc;
+    if (wantMp3) {
+      blob = await encodeMp3(finalAudio, (p) => setProgress(40 + p * 60, 'Encoding MP3…'));
+      ext = 'mp3';
+      codecDesc = 'MP3 · 192 kbps';
+    } else {
+      const bitmap = await loadBitmap(imageFile);
+      const dims = pickDims(bitmap);
+      const combo = await probeTurbo(dims[0], dims[1]);
+      if (combo) {
+        console.log('[bpvm] turbo encode:', combo.v, '+', combo.a);
+        const t0 = performance.now();
+        blob = await encodeFastMp4(bitmap, finalAudio, combo, (p, speed) => {
+          setProgress(40 + p * 60, 'Encoding video…' +
+            (speed >= 1 ? ' ≈' + (speed >= 10 ? Math.round(speed) : speed.toFixed(1).replace(/\.0$/, '')) + '× real time' : ''));
+        });
+        console.log('[bpvm] turbo done in', ((performance.now() - t0) / 1000).toFixed(1) + 's for',
+          finalAudio.duration.toFixed(1) + 's of audio');
+        ext = 'mp4';
+        codecDesc = 'MP4 · ' + (combo.muxV === 'avc' ? 'H.264' : 'VP9') + ' + ' +
+          (combo.muxA === 'aac' ? 'AAC' : 'Opus') + ' · fast encode';
+      } else {
+        /* fallback: real-time recording (old path, unchanged) */
+        await ensureRunning();
+        const mins = Math.max(1, Math.ceil((finalAudio.duration + 10) / 60));
+        if (finalAudio.duration > 900) toast('Heads up: long audio = long wait (and lots of memory). Recording happens in real time.', 'err');
+        blob = await recordVideo(bitmap, finalAudio, (p) => {
+          setProgress(50 + p * 50, 'Recording your video… keep this tab visible (takes about ' + mins + ' min)');
+        });
+        ext = (blob.type || '').includes('mp4') ? 'mp4' : 'webm';
+        codecDesc = (ext === 'mp4' ? 'MP4' : 'WebM') + ' · real-time recording';
+      }
+    }
+    setProgress(100, 'Done — your ' + (wantMp3 ? 'MP3' : 'video') + ' is ready below!');
 
     /* phase 5 — show it */
+    const isAudio = blob.type === 'audio/mpeg';
     const url = URL.createObjectURL(blob);
-    if (els.video.src && els.video.src.startsWith('blob:')) URL.revokeObjectURL(els.video.src);
-    els.video.src = url;
-    fixWebmDuration(els.video);
-    const ext = (blob.type || '').includes('mp4') ? 'mp4' : 'webm';
+    [els.video, els.audioResult].forEach((el) => {
+      if (el.src && el.src.startsWith('blob:') && el.src !== url) URL.revokeObjectURL(el.src);
+    });
+    els.video.classList.toggle('hidden', isAudio);
+    els.audioResult.classList.toggle('hidden', !isAudio);
+    if (isAudio) els.audioResult.src = url;
+    else { els.video.src = url; fixWebmDuration(els.video); }
+    els.resultTitle.textContent = isAudio ? 'Your MP3' : 'Your video';
     els.download.href = url;
-    els.download.setAttribute('download', 'bathroom-party-video.' + ext);
-    els.info.textContent = (blob.type.split(';')[0] || 'video') + ' · ' + fmtSize(blob.size) +
-      ' · ' + fmtTime(finalAudio.duration) + ' long';
+    els.download.setAttribute('download', isAudio ? 'bathroom-party.mp3' : 'bathroom-party.' + ext);
+    els.download.textContent = isAudio ? 'Download MP3' : 'Download video';
+    els.info.textContent = [codecDesc, fmtSize(blob.size), fmtTime(finalAudio.duration) + ' long']
+      .filter(Boolean).join(' · ');
     els.result.classList.remove('hidden');
-    els.video.play().catch(() => {});
+    (isAudio ? els.audioResult : els.video).play().catch(() => {});
     els.result.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (err) {
     console.error(err);
@@ -1390,6 +1650,11 @@ function startOver() {
   spSyncHelperCmd();
   if (els.video.src && els.video.src.startsWith('blob:')) URL.revokeObjectURL(els.video.src);
   els.video.removeAttribute('src'); els.video.load();
+  if (els.audioResult.src && els.audioResult.src.startsWith('blob:')) URL.revokeObjectURL(els.audioResult.src);
+  els.audioResult.removeAttribute('src'); els.audioResult.load();
+  els.video.classList.remove('hidden');
+  els.audioResult.classList.add('hidden');
+  els.resultTitle.textContent = 'Your video';
   if (els.imageThumb.src && els.imageThumb.src.startsWith('blob:')) URL.revokeObjectURL(els.imageThumb.src);
   els.imageThumb.removeAttribute('src');
   els.imagePreview.classList.add('hidden');
@@ -1489,6 +1754,15 @@ els.optMuffle.addEventListener('input', () => { els.muffleVal.textContent = els.
 els.optVolume.addEventListener('input', () => { els.volumeVal.textContent = els.optVolume.value + '%'; });
 els.makeBtn.addEventListener('click', makeVideo);
 els.remake.addEventListener('click', startOver);
+
+/* ---- output format picker ---- */
+document.querySelectorAll('input[name="fmt"]').forEach((r) => r.addEventListener('change', updateFmtUI));
+
+/* Prefetch the party sounds while the user is still picking files,
+   and detect the fast-encode path for the hint under the picker. */
+Object.keys(PARTY_SOUNDS).forEach((k) => { getSound(k); });
+probeTurbo().then((c) => { turboCombo = c; updateFmtUI(); });
+updateFmtUI();
 
 /* ---- spotify wiring ---- */
 spEls.importBtn.addEventListener('click', importPlaylist);
